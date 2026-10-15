@@ -2,7 +2,7 @@ name: sort inbox
 
 on:
   schedule:
-    - cron: "*/15 * * * *"  # every 15 minutes
+        - cron: "7,22,37,52 * * * *"  # every 15 minutes, off the busy times
   workflow_dispatch:         # lets you run it by hand from the actions tab
     inputs:
       dry_run:
