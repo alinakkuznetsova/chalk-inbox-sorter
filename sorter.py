@@ -1,26 +1,23 @@
-"""reads new emails in the chalk inbox, classifies them with an llm, files them and logs the result to supabase"""
+"""reads new emails in the chalk inbox, classifies them with an llm, tags them in zoho mail and logs the result to supabase"""
 
-import email
-import imaplib
 import json
 import os
 import re
 import sys
-from datetime import date, timedelta
-from email.header import decode_header, make_header
-from email.utils import parseaddr, parsedate_to_datetime
+import time
+from datetime import datetime, timezone
 from html import unescape
 
 import requests
 
-# category -> zoho folder name (no "&" because imap folder names treat it as a special character)
-FOLDERS = {
-    "Venue Enquiries": "Venue Enquiries",
-    "Event Changes": "Event Changes",
-    "User Support": "User Support",
-    "Feedback and Bugs": "Feedback and Bugs",
-    "Partnerships and Press": "Partnerships and Press",
-    "Other": "Other",
+# category -> tag colour in zoho (yellow, pink and blue echo chalk's chalk-pop colours)
+TAGS = {
+    "Venue Enquiries": "#F5C518",
+    "Event Changes": "#F48FB1",
+    "User Support": "#64B5F6",
+    "Feedback and Bugs": "#FFA726",
+    "Partnerships and Press": "#81C784",
+    "Other": "#BDBDBD",
 }
 
 SYSTEM_PROMPT = """You sort emails sent to hello@findchalk.com for Chalk, a London app for discovering local events, starting with pub events.
@@ -50,7 +47,7 @@ SCHEMA = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "category": {"type": "string", "enum": list(FOLDERS)},
+            "category": {"type": "string", "enum": list(TAGS)},
             "priority": {"type": "string", "enum": ["urgent", "normal", "low"]},
             "summary": {"type": "string"},
         },
@@ -61,17 +58,7 @@ SCHEMA = {
 MAX_BODY_CHARS = 2000
 
 
-# ---------- email parsing ----------
-
-def decode(value):
-    """turns encoded headers like =?utf-8?b?...?= into plain text"""
-    if not value:
-        return ""
-    try:
-        return str(make_header(decode_header(value)))
-    except Exception:
-        return value
-
+# ---------- text cleaning ----------
 
 def strip_html(html):
     html = re.sub(r"(?is)<(script|style|head).*?</\1>", " ", html)
@@ -81,52 +68,84 @@ def strip_html(html):
 
 
 def clean(text):
-    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"[ \t\r\f\v\xa0]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n\n", text)
     return text.strip()[:MAX_BODY_CHARS]
 
 
-def get_body(msg):
-    """prefers the plain text part, falls back to html with the tags stripped out"""
-    plain, html = None, None
-    for part in msg.walk():
-        if part.get_content_maintype() == "multipart":
-            continue
-        if (part.get("Content-Disposition") or "").lower().startswith("attachment"):
-            continue
-        payload = part.get_payload(decode=True)
-        if payload is None:
-            continue
-        text = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
-        if part.get_content_type() == "text/plain" and plain is None:
-            plain = text
-        elif part.get_content_type() == "text/html" and html is None:
-            html = text
-    if plain and plain.strip():
-        return clean(plain)
-    if html:
-        return clean(strip_html(html))
-    return ""
+# ---------- zoho mail api ----------
+
+class ZohoMail:
+    def __init__(self, client_id, client_secret, refresh_token, region="uk", http=requests):
+        self.http = http
+        self.accounts_url = f"https://accounts.zoho.{region}"
+        self.api = f"https://mail.zoho.{region}/api"
+        self.client_id, self.client_secret, self.refresh_token = client_id, client_secret, refresh_token
+        self.token = self._access_token()
+        self.account_id = self._call("GET", "/accounts")["data"][0]["accountId"]
+
+    def _access_token(self):
+        """swaps the long-lived refresh token for an access token that lasts an hour"""
+        r = self.http.post(f"{self.accounts_url}/oauth/v2/token", params={
+            "refresh_token": self.refresh_token,
+            "grant_type": "refresh_token",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+        }, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if "access_token" not in data:
+            raise RuntimeError(f"zoho token refresh failed: {data}")
+        return data["access_token"]
+
+    def _call(self, method, path, **kwargs):
+        r = self.http.request(method, self.api + path, headers={"Authorization": f"Zoho-oauthtoken {self.token}"}, timeout=20, **kwargs)
+        r.raise_for_status()
+        return r.json()
+
+    def _account(self, path):
+        return f"/accounts/{self.account_id}{path}"
+
+    def inbox_id(self):
+        for folder in self._call("GET", self._account("/folders"))["data"]:
+            if folder.get("folderType") == "Inbox" or folder.get("folderName") == "Inbox":
+                return folder["folderId"]
+        raise RuntimeError("could not find the inbox folder")
+
+    def recent_messages(self, folder_id, limit=50):
+        return self._call("GET", self._account("/messages/view"), params={"folderId": folder_id, "limit": limit, "sortorder": "false"})["data"]
+
+    def content(self, folder_id, message_id):
+        return self._call("GET", self._account(f"/folders/{folder_id}/messages/{message_id}/content"))["data"]["content"]
+
+    def ensure_tags(self):
+        """returns {tag name: tag id}, creating any missing tags with their colours"""
+        existing = {t["displayName"]: t["labelId"] for t in self._call("GET", self._account("/labels"))["data"]}
+        for name, colour in TAGS.items():
+            if name in existing:
+                continue
+            try:
+                data = self._call("POST", self._account("/labels"), json={"displayName": name, "color": colour})
+            except requests.HTTPError:  # fall back to zoho's default colour if this one is not allowed
+                data = self._call("POST", self._account("/labels"), json={"displayName": name})
+            existing[name] = data["data"]["labelId"]
+        return existing
+
+    def apply_tag(self, message_id, tag_id):
+        self._call("PUT", self._account("/updatemessage"), json={"mode": "applyLabel", "messageId": [as_id(message_id)], "labelId": [str(tag_id)]})
+
+    def flag(self, message_id):
+        self._call("PUT", self._account("/updatemessage"), json={"mode": "setFlag", "messageId": [as_id(message_id)], "flagid": "important"})
 
 
-def parse_email(raw):
-    msg = email.message_from_bytes(raw)
-    try:
-        received = parsedate_to_datetime(msg.get("Date")).isoformat()
-    except Exception:
-        received = None
-    return {
-        "message_id": (msg.get("Message-ID") or "").strip(),
-        "from_email": parseaddr(decode(msg.get("From")))[1],
-        "subject": decode(msg.get("Subject")),
-        "received_at": received,
-        "body": get_body(msg),
-    }
+def as_id(value):
+    value = str(value)
+    return int(value) if value.isdigit() else value
 
 
 # ---------- llm ----------
 
-def classify(client, model, parsed):
+def classify(client, model, sender, subject, body):
     response = client.chat.completions.create(
         model=model,
         temperature=0,
@@ -134,11 +153,11 @@ def classify(client, model, parsed):
         response_format={"type": "json_schema", "json_schema": SCHEMA},
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"From: {parsed['from_email']}\nSubject: {parsed['subject']}\n\n{parsed['body']}"},
+            {"role": "user", "content": f"From: {sender}\nSubject: {subject}\n\n{body}"},
         ],
     )
     result = json.loads(response.choices[0].message.content)
-    if result["category"] not in FOLDERS:  # belt and braces, the schema should already guarantee this
+    if result["category"] not in TAGS:  # belt and braces, the schema should already guarantee this
         result["category"] = "Other"
     return result
 
@@ -146,116 +165,89 @@ def classify(client, model, parsed):
 # ---------- supabase ----------
 
 class Log:
-    def __init__(self, url, key):
+    def __init__(self, url, key, http=requests):
+        self.http = http
         self.endpoint = url.rstrip("/") + "/rest/v1/inbox_log"
         self.headers = {"apikey": key, "Content-Type": "application/json"}
         if not key.startswith("sb_"):  # legacy service_role keys are jwts and also go in the authorization header
             self.headers["Authorization"] = f"Bearer {key}"
 
     def has(self, message_id):
-        r = requests.get(self.endpoint, headers=self.headers, params={"message_id": f'eq."{message_id}"', "select": "id"}, timeout=15)
+        r = self.http.get(self.endpoint, headers=self.headers, params={"message_id": f'eq."{message_id}"', "select": "id"}, timeout=15)
         r.raise_for_status()
         return len(r.json()) > 0
 
     def add(self, row):
-        r = requests.post(self.endpoint, headers={**self.headers, "Prefer": "return=minimal"}, json=row, timeout=15)
+        r = self.http.post(self.endpoint, headers={**self.headers, "Prefer": "return=minimal"}, json=row, timeout=15)
         r.raise_for_status()
 
 
-# ---------- imap ----------
-
-imaplib.Commands.setdefault("MOVE", ("SELECTED",))
-
-
-def quote(folder):
-    return '"' + folder.replace('"', "") + '"'
-
-
-def ensure_folders(imap):
-    for folder in FOLDERS.values():
-        try:
-            imap.create(quote(folder))  # errors harmlessly if the folder already exists
-        except imaplib.IMAP4.error:
-            pass
-
-
-def move(imap, uid, folder):
-    """uses imap MOVE if the server supports it, otherwise copy then delete"""
-    try:
-        typ, _ = imap.uid("MOVE", uid, quote(folder))
-        if typ == "OK":
-            return
-    except imaplib.IMAP4.error:
-        pass
-    typ, _ = imap.uid("COPY", uid, quote(folder))
-    if typ != "OK":
-        raise RuntimeError(f"could not copy message to {folder}")
-    imap.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
-    imap.expunge()
-
-
 # ---------- main ----------
+
+def to_iso(ms):
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        return None
+
 
 def main():
     from openai import OpenAI
 
     dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
     model = os.environ.get("MODEL", "gpt-4.1-mini")
-    lookback = int(os.environ.get("LOOKBACK_DAYS", "2"))
+    lookback_ms = int(os.environ.get("LOOKBACK_DAYS", "2")) * 86_400_000
+
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     log = Log(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+    zoho = ZohoMail(os.environ["ZOHO_CLIENT_ID"], os.environ["ZOHO_CLIENT_SECRET"], os.environ["ZOHO_REFRESH_TOKEN"], os.environ.get("ZOHO_REGION", "uk"))
 
-    imap = imaplib.IMAP4_SSL(os.environ.get("IMAP_HOST", "imappro.zoho.uk"), 993)
-    imap.login(os.environ["EMAIL_ADDRESS"], os.environ["EMAIL_PASSWORD"])
-    if not dry_run:
-        ensure_folders(imap)
-    imap.select("INBOX")
-
-    since = (date.today() - timedelta(days=lookback)).strftime("%d-%b-%Y")
-    _, data = imap.uid("SEARCH", None, "SINCE", since)
-    uids = data[0].split()
-    print(f"{len(uids)} emails in the inbox from the last {lookback} days" + (" (dry run)" if dry_run else ""))
+    inbox = zoho.inbox_id()
+    tags = {} if dry_run else zoho.ensure_tags()
+    cutoff = time.time() * 1000 - lookback_ms
+    messages = [m for m in zoho.recent_messages(inbox) if int(m.get("receivedTime", 0)) >= cutoff]
+    print(f"{len(messages)} emails in the inbox from the last {lookback_ms // 86_400_000} days" + (" (dry run)" if dry_run else ""))
 
     done, skipped, failed = 0, 0, 0
-    for uid in uids:
+    for m in messages:
+        message_id = str(m["messageId"])
+        key = f"zoho:{message_id}"
         try:
-            # BODY.PEEK reads the email without marking it as read
-            _, msg_data = imap.uid("FETCH", uid, "(BODY.PEEK[])")
-            parsed = parse_email(msg_data[0][1])
-            message_id = parsed["message_id"] or f"uid-{uid.decode()}"
-
-            if log.has(message_id):  # already handled on an earlier run
+            if log.has(key):  # already handled on an earlier run
                 skipped += 1
                 continue
 
-            result = classify(client, model, parsed)
-            print(f"- {parsed['subject'][:60]!r} -> {result['category']} / {result['priority']}: {result['summary']}")
+            subject = m.get("subject") or ""
+            sender = m.get("fromAddress") or m.get("sender") or ""
+            try:
+                body = clean(strip_html(zoho.content(inbox, message_id)))
+            except Exception:
+                body = clean(m.get("summary") or "")  # fall back to zoho's preview text
+
+            result = classify(client, model, sender, subject, body)
+            print(f"- {subject[:60]!r} -> {result['category']} / {result['priority']}: {result['summary']}")
             if dry_run:
                 continue
 
-            # log first: if moving fails, the email is not lost and the log shows what happened
+            # log first: if tagging fails, the log still shows what happened
             log.add({
-                "message_id": message_id,
-                "received_at": parsed["received_at"],
-                "from_email": parsed["from_email"],
-                "subject": parsed["subject"][:500],
+                "message_id": key,
+                "received_at": to_iso(m.get("receivedTime")),
+                "from_email": sender,
+                "subject": subject[:500],
                 "category": result["category"],
                 "priority": result["priority"],
                 "summary": result["summary"],
                 "model": model,
             })
-
-            # urgent emails stay in the inbox and get flagged, everything else is filed away
+            zoho.apply_tag(message_id, tags[result["category"]])
             if result["priority"] == "urgent":
-                imap.uid("STORE", uid, "+FLAGS", "(\\Flagged)")
-            else:
-                move(imap, uid, FOLDERS[result["category"]])
+                zoho.flag(message_id)
             done += 1
         except Exception as e:
             failed += 1
-            print(f"! failed on uid {uid.decode()}: {e}")
+            print(f"! failed on message {message_id}: {e}")
 
-    imap.logout()
     print(f"done: {done} sorted, {skipped} already sorted, {failed} failed")
     if failed:
         sys.exit(1)  # makes the github action show as failed so you get an email
